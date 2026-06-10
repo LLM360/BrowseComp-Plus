@@ -86,6 +86,16 @@ def main():
         default=5,
         help="Fixed number of search results to return for all queries in this session (default: 5).",
     )
+    parser.add_argument(
+        "--hf-token",
+        type=str,
+        help="Hugging Face token for accessing private datasets/models. If not provided, will use environment variables or CLI login.",
+    )
+    parser.add_argument(
+        "--hf-home",
+        type=str,
+        help="Hugging Face home directory for caching models and datasets. If not provided, will use environment variables or default.",
+    )
 
     temp_args, _ = parser.parse_known_args()
 
@@ -94,6 +104,15 @@ def main():
     searcher_class.parse_args(parser)
 
     args = parser.parse_args()
+
+    if args.hf_token:
+        print(f"[DEBUG] Setting HF token from CLI argument: {args.hf_token[:10]}...")
+        os.environ["HF_TOKEN"] = args.hf_token
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = args.hf_token
+
+    if args.hf_home:
+        print(f"[DEBUG] Setting HF home from CLI argument: {args.hf_home}")
+        os.environ["HF_HOME"] = args.hf_home
 
     global snippet_tokenizer
     if args.snippet_max_tokens > 0:
@@ -109,6 +128,13 @@ def main():
     class SearchRequest(BaseModel):
         query: str
 
+    class DocumentRequest(BaseModel):
+        docid: str
+
+    @app.get("/health")
+    def health_endpoint():
+        return {"status": "ok"}
+
     @app.post("/retrieve")
     def search_endpoint(request: SearchRequest):
         search_results = searcher.search(request.query, k=args.k)
@@ -118,6 +144,10 @@ def main():
         )
 
         return {"result": formatted_results}
+
+    @app.post("/document")
+    def document_endpoint(request: DocumentRequest):
+        return {"result": searcher.get_document(request.docid)}
 
     print(f"Starting {searcher.search_type} search server on port {args.port}")
     print(

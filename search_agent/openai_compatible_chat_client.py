@@ -297,6 +297,8 @@ def run_conversation_with_tools(
     max_iterations: int = 100,
     raw_dump_dir: str | None = None,
     raw_trace_name: str | None = None,
+    tool_format: str | None = None,
+    reasoning_effort: str | None = None,
 ):
     tools = tool_handler.get_tool_definitions()
 
@@ -319,6 +321,11 @@ def run_conversation_with_tools(
 
     finish_reason: Optional[str] = None
     global_max_tokens = max_tokens
+    chat_template_kwargs: dict[str, Any] = {}
+    if tool_format and tool_format != "none":
+        chat_template_kwargs["tool_format"] = tool_format
+    if reasoning_effort and reasoning_effort != "none":
+        chat_template_kwargs["reasoning_effort"] = reasoning_effort
 
     for iteration_index in range(1, max_iterations + 1):
         remaining_tokens = global_max_tokens - cumulative_usage["completion_tokens"]
@@ -334,6 +341,10 @@ def run_conversation_with_tools(
                 "tools": tools,
                 "max_tokens": request_max_tokens,
             }
+            if chat_template_kwargs:
+                create_kwargs["extra_body"] = {
+                    "chat_template_kwargs": chat_template_kwargs,
+                }
             if temperature is not None:
                 create_kwargs["temperature"] = temperature
             if top_p is not None:
@@ -580,6 +591,8 @@ def _process_tsv_dataset(tsv_path: str, client: OpenAI, args, tool_handler: Sear
             max_iterations=args.max_iterations,
             raw_dump_dir=raw_dump_dir,
             raw_trace_name=raw_trace_name,
+            tool_format=args.tool_format,
+            reasoning_effort=args.reasoning_effort,
         )
 
         with completed_lock:
@@ -646,6 +659,16 @@ def main():
     parser.add_argument("--query-template", choices=["QUERY_TEMPLATE", "QUERY_TEMPLATE_NO_GET_DOCUMENT", "QUERY_TEMPLATE_NO_GET_DOCUMENT_NO_CITATION"], default="QUERY_TEMPLATE_NO_GET_DOCUMENT", help="Specify the query template to use")
     parser.add_argument("--temperature", type=float, default=None, help="Temperature for the model (default: use model defaults)")
     parser.add_argument("--top_p", type=float, default=None, help="Top P for the model (default: use model defaults)")
+    parser.add_argument(
+        "--tool-format",
+        default=None,
+        help="Optional vLLM chat_template_kwargs.tool_format value, for example 'glm'. Use 'none' to omit.",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        default=None,
+        help="Optional vLLM chat_template_kwargs.reasoning_effort value, for example 'high'. Use 'none' to omit.",
+    )
     parser.add_argument(
         "--num-threads",
         type=int,
@@ -791,6 +814,8 @@ def main():
         max_iterations=args.max_iterations,
         raw_dump_dir=str(Path(args.output_dir) / "raw_responses") if args.dump_raw_responses else None,
         raw_trace_name="single",
+        tool_format=args.tool_format,
+        reasoning_effort=args.reasoning_effort,
     )
 
     _persist_response(

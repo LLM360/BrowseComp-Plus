@@ -8,6 +8,7 @@ from .base import BaseSearcher
 from .bm25_searcher import BM25Searcher
 from .custom_searcher import CustomSearcher
 from .faiss_searcher import FaissSearcher, ReasonIrSearcher
+from .remote_searcher import RemoteSearcher
 
 
 class SearcherType(Enum):
@@ -16,6 +17,7 @@ class SearcherType(Enum):
     BM25 = ("bm25", BM25Searcher)
     FAISS = ("faiss", FaissSearcher)
     REASONIR = ("reasonir", ReasonIrSearcher)
+    REMOTE = ("remote", RemoteSearcher)
     CUSTOM = (
         "custom",
         CustomSearcher,
