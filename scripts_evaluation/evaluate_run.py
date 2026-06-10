@@ -3,7 +3,7 @@ import csv
 import json
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -195,6 +195,129 @@ def calculate_calibration_error(
     calibration_error = calib_err(confidence, correct, p="2", beta=beta)
 
     return calibration_error * 100
+
+
+def _normalize_tool_name(tool_name: str | None) -> str | None:
+    if not tool_name:
+        return None
+    tool_name = str(tool_name).strip()
+    if tool_name.startswith("functions."):
+        tool_name = tool_name.split(".", 1)[1]
+    return tool_name or None
+
+
+def _average_saved_tool_counts(all_results: List[dict]) -> dict:
+    tool_counts_sum = Counter()
+    for result in all_results:
+        for tool_name, count in (result.get("tool_call_counts") or {}).items():
+            normalized_name = _normalize_tool_name(tool_name)
+            if normalized_name:
+                tool_counts_sum[normalized_name] += count
+    return {
+        tool_name: count / len(all_results)
+        for tool_name, count in tool_counts_sum.items()
+    }
+
+
+def _raw_trace_tool_counts_for_query(raw_trace_dir: Path) -> Counter:
+    tool_counts = Counter()
+    for iter_path in sorted(raw_trace_dir.glob("iter_*.json")):
+        try:
+            with iter_path.open("r", encoding="utf-8") as f:
+                raw_iter = json.load(f)
+        except Exception:
+            continue
+
+        effective_tool_calls = (
+            (raw_iter.get("parsed") or {}).get("effective_tool_calls") or []
+        )
+        for tool_call in effective_tool_calls:
+            tool_name = _normalize_tool_name(tool_call.get("name"))
+            if tool_name:
+                tool_counts[tool_name] += 1
+
+    return tool_counts
+
+
+def _average_raw_trace_tool_counts(input_dir: Path, all_results: List[dict]):
+    raw_root = input_dir / "raw_responses"
+    if not raw_root.is_dir():
+        return None, {
+            "source": "raw_responses",
+            "reason": f"raw trace directory not found: {raw_root}",
+            "query_count": len(all_results),
+            "queries_with_raw_trace": 0,
+        }
+
+    query_ids = []
+    missing_query_ids = []
+    for index, result in enumerate(all_results):
+        query_id = result.get("query_id")
+        if query_id is None:
+            missing_query_ids.append(f"<missing query_id at result index {index}>")
+            continue
+        query_ids.append(str(query_id))
+    queries_with_raw_trace = 0
+    tool_counts_sum = Counter()
+
+    for query_id in query_ids:
+        raw_trace_dir = raw_root / f"query_{query_id}"
+        has_raw_iterations = (
+            raw_trace_dir.is_dir()
+            and next(raw_trace_dir.glob("iter_*.json"), None) is not None
+        )
+        if not has_raw_iterations:
+            missing_query_ids.append(query_id)
+            continue
+
+        queries_with_raw_trace += 1
+        tool_counts_sum.update(_raw_trace_tool_counts_for_query(raw_trace_dir))
+
+    metadata = {
+        "source": "raw_responses",
+        "query_count": len(all_results),
+        "queries_with_raw_trace": queries_with_raw_trace,
+        "missing_query_count": len(missing_query_ids),
+        "missing_query_ids_sample": missing_query_ids[:20],
+    }
+
+    if missing_query_ids:
+        return None, metadata
+
+    return {
+        tool_name: count / len(all_results)
+        for tool_name, count in tool_counts_sum.items()
+    }, metadata
+
+
+def calculate_average_tool_counts(
+    input_dir: Path, all_results: List[dict], source: str
+) -> tuple[dict, dict]:
+    if source == "saved":
+        return _average_saved_tool_counts(all_results), {"source": "run_json"}
+
+    raw_tool_counts, raw_metadata = _average_raw_trace_tool_counts(
+        input_dir, all_results
+    )
+    if raw_tool_counts is not None:
+        return raw_tool_counts, raw_metadata
+
+    if source == "raw":
+        raise ValueError(
+            "Raw trace tool counts requested, but raw_responses coverage is incomplete: "
+            f"{raw_metadata}"
+        )
+
+    print(
+        "Warning: raw_responses tool counts unavailable or incomplete; "
+        "falling back to tool_call_counts saved in run JSON files. "
+        f"Raw trace metadata: {raw_metadata}"
+    )
+    fallback_metadata = {
+        "source": "run_json",
+        "fallback_reason": raw_metadata,
+    }
+    return _average_saved_tool_counts(all_results), fallback_metadata
 
 
 def mirror_directory_structure(input_dir: Path, output_dir: Path) -> Path:
@@ -417,6 +540,16 @@ def main():
         help="Path to qrel positives file",
     )
     parser.add_argument(
+        "--tool_counts_source",
+        choices=["auto", "raw", "saved"],
+        default="auto",
+        help=(
+            "Source for average tool-call metrics. 'auto' uses complete "
+            "raw_responses traces when available, otherwise falls back to "
+            "tool_call_counts saved in run JSON files."
+        ),
+    )
+    parser.add_argument(
         "--batch_size", type=int, default=64, help="Batch size for vLLM chat calls"
     )
     parser.add_argument(
@@ -636,15 +769,9 @@ def main():
         print("No results to analyze")
         return
 
-    all_tool_counts = defaultdict(int)
-
-    for result in all_results:
-        tool_counts = result.get("tool_call_counts", {})
-        for tool_name, count in tool_counts.items():
-            all_tool_counts[tool_name] += count
-
-    for tool_name, count in all_tool_counts.items():
-        all_tool_counts[tool_name] = count / len(all_results)
+    all_tool_counts, tool_counts_metadata = calculate_average_tool_counts(
+        input_dir, all_results, args.tool_counts_source
+    )
 
     confidences = []
     correctness = []
@@ -773,6 +900,7 @@ def main():
         "Accuracy (%)": accuracy_percent,
         "Recall (%)": recall_percent,
         "avg_tool_stats": all_tool_counts,
+        "avg_tool_stats_source": tool_counts_metadata,
         "Calibration Error (%)": calibration_err_percent,
         "Retriever": "change me when submitting",
         "Link": "change me when submitting",
@@ -791,6 +919,7 @@ def main():
         )
     )
     print(f"Average Tool Calls: {all_tool_counts}")
+    print(f"Average Tool Calls Source: {tool_counts_metadata}")
     print(
         "Calibration Error: "
         + (
