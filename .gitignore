@@ -10,3 +10,8 @@ data/browsecomp_plus_decrypted.jsonl
 topics-qrels/queries.tsv
 runs/
 evals/
+hub/
+xet/
+data/
+.codex
+Tevatron*
