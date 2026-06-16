@@ -400,7 +400,7 @@ def run_conversation_with_tools(
 
         assistant_msg = choice.message.model_dump()
 
-        reasoning_output = assistant_msg.pop("reasoning_content", None)
+        reasoning_output = assistant_msg.get("reasoning_content", None)
         content_reasoning, cleaned_content = _split_reasoning_and_content(
             assistant_msg.get("content")
         )

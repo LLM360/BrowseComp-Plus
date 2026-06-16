@@ -5,6 +5,7 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -501,6 +502,18 @@ def save_detailed_csv(all_results: List[dict], output_dir: Path):
     return csv_path
 
 
+def _default_parallelism() -> int:
+    raw_value = os.getenv("OPENAI_EVAL_PARALLELISM", "8")
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        print(
+            f"Warning: invalid OPENAI_EVAL_PARALLELISM={raw_value!r}; using 8",
+            file=sys.stderr,
+        )
+        return 8
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate browsecomp responses using OpenAI judge model."
@@ -541,8 +554,19 @@ def main():
             "tool_call_counts saved in run JSON files."
         ),
     )
+    parser.add_argument(
+        "--parallelism",
+        type=int,
+        default=_default_parallelism(),
+        help=(
+            "Number of concurrent OpenAI judge requests. Defaults to "
+            "OPENAI_EVAL_PARALLELISM or 8. Use 1 for sequential behavior."
+        ),
+    )
 
     args = parser.parse_args()
+    if args.parallelism < 1:
+        raise ValueError(f"--parallelism must be >= 1, got {args.parallelism}")
 
     input_dir = Path(args.input_dir)
     eval_dir = Path(args.eval_dir)
@@ -572,6 +596,7 @@ def main():
     print(f"Found {len(json_files)} JSON files to evaluate")
 
     all_results = []
+    pending_items = []
     skipped = 0
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -594,7 +619,7 @@ def main():
         except Exception:
             pass
 
-    for json_path in tqdm(json_files, desc="Evaluating"):
+    for json_path in tqdm(json_files, desc="Loading & preparing", unit="file"):
         eval_path = output_dir / f"{json_path.stem}_eval.json"
         if eval_path.exists() and not args.force:
             try:
@@ -672,53 +697,59 @@ def main():
             continue
 
         judge_prompt = create_judge_prompt(gt_question, response, correct_answer)
+        pending_items.append(
+            {
+                "json_path": json_path,
+                "eval_path": eval_path,
+                "query_id": query_id,
+                "gt_question": gt_question,
+                "correct_answer": correct_answer,
+                "response": response,
+                "is_completed": is_completed,
+                "retrieved_docids_set": retrieved_docids_set,
+                "retrieval_recall": retrieval_recall,
+                "tool_call_counts": run_data.get("tool_call_counts", {}),
+                "judge_prompt": judge_prompt,
+            }
+        )
 
-        try:
-            judge_response = call_openai_judge(
-                client,
-                judge_prompt,
-                args.model,
-                args.max_output_tokens,
-            )
+    def evaluate_pending_item(item: dict) -> tuple[dict, Path]:
+        judge_response = call_openai_judge(
+            client,
+            item["judge_prompt"],
+            args.model,
+            args.max_output_tokens,
+        )
 
-            judge_text = (
-                judge_response.output_text
-                if hasattr(judge_response, "output_text")
-                else ""
-            )
+        judge_text = (
+            judge_response.output_text if hasattr(judge_response, "output_text") else ""
+        )
 
-            judge_result = parse_judge_response(judge_text)
-
-            cited_docids = extract_citations_from_response(response)
-
-            positives_for_query = qrel_evidence.get(str(query_id), [])
-
-            citation_metrics_positives = compute_citation_metrics(
-                cited_docids, positives_for_query
-            )
-
-        except Exception as e:
-            print(f"Error calling judge model for {json_path}: {e}")
-            continue
+        judge_result = parse_judge_response(judge_text)
+        cited_docids = extract_citations_from_response(item["response"])
+        positives_for_query = qrel_evidence.get(str(item["query_id"]), [])
+        citation_metrics_positives = compute_citation_metrics(
+            cited_docids, positives_for_query
+        )
 
         result = {
-            "json_path": str(json_path),
-            "query_id": query_id,
-            "question": gt_question,
-            "response": response,
-            "correct_answer": correct_answer,
-            "is_completed": is_completed,
-            "judge_prompt": judge_prompt,
+            "json_path": str(item["json_path"]),
+            "query_id": item["query_id"],
+            "question": item["gt_question"],
+            "response": item["response"],
+            "correct_answer": item["correct_answer"],
+            "is_completed": item["is_completed"],
+            "judge_prompt": item["judge_prompt"],
             "judge_response": judge_text,
             "judge_result": judge_result,
-            "tool_call_counts": run_data.get("tool_call_counts", {}),
+            "tool_call_counts": item["tool_call_counts"],
             "citations": {
                 "cited_docids": cited_docids,
                 "metrics": citation_metrics_positives,
             },
             "retrieval": {
-                "retrieved_docids": sorted(list(retrieved_docids_set)),
-                "recall": retrieval_recall,
+                "retrieved_docids": sorted(list(item["retrieved_docids_set"])),
+                "recall": item["retrieval_recall"],
             },
             "model_info": {
                 "judge_model": args.model,
@@ -726,13 +757,47 @@ def main():
             },
         }
 
-        all_results.append(result)
+        return result, item["eval_path"]
 
-        try:
-            with eval_path.open("w", encoding="utf-8") as f:
-                json.dump(result, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"Error saving evaluation to {eval_path}: {e}")
+    def save_eval_result(result: dict, eval_path: Path) -> None:
+        with eval_path.open("w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+
+    if pending_items:
+        worker_count = min(args.parallelism, len(pending_items))
+        print(
+            f"Judging {len(pending_items)} completed responses "
+            f"with OpenAI parallelism={worker_count}"
+        )
+
+        if worker_count == 1:
+            iterator = tqdm(pending_items, desc="Judging", unit="request")
+            for item in iterator:
+                try:
+                    result, eval_path = evaluate_pending_item(item)
+                    save_eval_result(result, eval_path)
+                    all_results.append(result)
+                except Exception as e:
+                    print(f"Error calling judge model for {item['json_path']}: {e}")
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_to_item = {
+                    executor.submit(evaluate_pending_item, item): item
+                    for item in pending_items
+                }
+                for future in tqdm(
+                    as_completed(future_to_item),
+                    total=len(future_to_item),
+                    desc="Judging",
+                    unit="request",
+                ):
+                    item = future_to_item[future]
+                    try:
+                        result, eval_path = future.result()
+                        save_eval_result(result, eval_path)
+                        all_results.append(result)
+                    except Exception as e:
+                        print(f"Error calling judge model for {item['json_path']}: {e}")
 
     print(f"\nProcessed {len(all_results)} evaluations ({skipped} skipped)")
 
