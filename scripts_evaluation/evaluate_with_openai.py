@@ -153,6 +153,64 @@ def parse_judge_response(judge_response: str) -> dict:
     return result
 
 
+def is_skipped_evaluation(result: dict) -> bool:
+    judge_result = result.get("judge_result", {}) or {}
+    return bool(result.get("skipped") or judge_result.get("skipped"))
+
+
+def mark_skipped_as_failure(result: dict) -> dict:
+    result["skipped"] = True
+    judge_result = result.setdefault("judge_result", {})
+    judge_result["skipped"] = True
+    judge_result["correct"] = False
+    return result
+
+
+def skipped_evaluation_result(
+    *,
+    json_path: Path,
+    query_id: str,
+    response: str,
+    correct_answer: str,
+    is_completed: bool,
+    status: str | None,
+    reason: str,
+    tool_call_counts: dict,
+    retrieval_recall: float,
+    retrieved_docids_set: set,
+    judge_model: str,
+    max_output_tokens: int,
+) -> dict:
+    return {
+        "json_path": str(json_path),
+        "query_id": query_id,
+        "response": response,
+        "correct_answer": correct_answer,
+        "is_completed": is_completed,
+        "status": status,
+        "skipped": True,
+        "skip_reason": reason,
+        "judge_prompt": None,
+        "judge_response": None,
+        "judge_result": {
+            "parse_error": True,
+            "skipped": True,
+            "correct": False,
+            "error": reason,
+        },
+        "tool_call_counts": tool_call_counts,
+        "citations": None,
+        "retrieval": {
+            "recall": retrieval_recall,
+            "retrieved_docids": sorted(list(retrieved_docids_set)),
+        },
+        "model_info": {
+            "judge_model": judge_model,
+            "max_output_tokens": max_output_tokens,
+        },
+    }
+
+
 # source: https://github.com/hendrycks/outlier-exposure/blob/master/utils/calibration_tools.py
 def calib_err(confidence, correct, p="2", beta=100):
     # beta is target bin size
@@ -588,7 +646,9 @@ def main():
     output_dir = mirror_directory_structure(input_dir, eval_dir)
     print(f"Evaluations will be saved to {output_dir}")
 
-    json_files = list(input_dir.glob("*.json"))
+    json_files = [
+        path for path in input_dir.glob("*.json") if not path.name.endswith("_eval.json")
+    ]
     if not json_files:
         print(f"No JSON files found in {input_dir}")
         return
@@ -625,8 +685,15 @@ def main():
             try:
                 with eval_path.open("r", encoding="utf-8") as f:
                     existing_eval = json.load(f)
+                if is_skipped_evaluation(existing_eval):
+                    skipped += 1
+                    mark_skipped_as_failure(existing_eval)
+                    try:
+                        with eval_path.open("w", encoding="utf-8") as f:
+                            json.dump(existing_eval, f, indent=2, ensure_ascii=False)
+                    except Exception as e:
+                        print(f"Error normalizing skipped evaluation at {eval_path}: {e}")
                 all_results.append(existing_eval)
-                skipped += 1
                 continue
             except:
                 pass  # If we can't load it, re-evaluate
@@ -646,7 +713,8 @@ def main():
         correct_answer = ground_truth[str(query_id)]["answer"]
         gt_question = ground_truth[str(query_id)]["question"]
 
-        is_completed = run_data["status"] == "completed"
+        status = run_data.get("status")
+        is_completed = status == "completed"
 
         retrieved_docids_set = set(run_data.get("retrieved_docids", []))
 
@@ -657,36 +725,27 @@ def main():
 
         response = ""
 
-        if (
-            len(run_data["result"]) > 0
-            and run_data["result"][-1]["type"] == "output_text"
-        ):
-            response = run_data["result"][-1]["output"]
+        result_items = run_data.get("result") or []
+        if result_items and result_items[-1].get("type") == "output_text":
+            response = result_items[-1].get("output") or ""
 
         if response == "" or not is_completed:
-            result = {
-                "json_path": str(json_path),
-                "query_id": query_id,
-                "response": response,
-                "correct_answer": correct_answer,
-                "is_completed": is_completed,
-                "judge_prompt": None,
-                "judge_response": None,
-                "judge_result": {
-                    "parse_error": True,
-                    "error": "Response incomplete or cannot be parsed",
-                },
-                "tool_call_counts": run_data.get("tool_call_counts", {}),
-                "citations": None,
-                "retrieval": {
-                    "recall": retrieval_recall,
-                    "retrieved_docids": sorted(list(retrieved_docids_set)),
-                },
-                "model_info": {
-                    "judge_model": args.model,
-                    "max_output_tokens": args.max_output_tokens,
-                },
-            }
+            reason = "Response missing or run status is not completed"
+            result = skipped_evaluation_result(
+                json_path=json_path,
+                query_id=query_id,
+                response=response,
+                correct_answer=correct_answer,
+                is_completed=is_completed,
+                status=status,
+                reason=reason,
+                tool_call_counts=run_data.get("tool_call_counts", {}),
+                retrieval_recall=retrieval_recall,
+                retrieved_docids_set=retrieved_docids_set,
+                judge_model=args.model,
+                max_output_tokens=args.max_output_tokens,
+            )
+            skipped += 1
             all_results.append(result)
 
             try:
@@ -799,7 +858,7 @@ def main():
                     except Exception as e:
                         print(f"Error calling judge model for {item['json_path']}: {e}")
 
-    print(f"\nProcessed {len(all_results)} evaluations ({skipped} skipped)")
+    print(f"\nProcessed {len(all_results)} evaluations ({skipped} judge skipped)")
 
     if not all_results:
         print("No results to analyze")

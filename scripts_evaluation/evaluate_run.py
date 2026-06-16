@@ -149,6 +149,64 @@ def parse_judge_response(judge_response: str) -> dict:
     return result
 
 
+def is_skipped_evaluation(result: dict) -> bool:
+    judge_result = result.get("judge_result", {}) or {}
+    return bool(result.get("skipped") or judge_result.get("skipped"))
+
+
+def mark_skipped_as_failure(result: dict) -> dict:
+    result["skipped"] = True
+    judge_result = result.setdefault("judge_result", {})
+    judge_result["skipped"] = True
+    judge_result["correct"] = False
+    return result
+
+
+def skipped_evaluation_result(
+    *,
+    json_path: Path,
+    query_id: str,
+    response: str,
+    correct_answer: str,
+    is_completed: bool,
+    status: str | None,
+    reason: str,
+    tool_call_counts: dict,
+    retrieval_recall: float,
+    retrieved_docids_set: set,
+    judge_model: str,
+    max_output_tokens: int,
+) -> dict:
+    return {
+        "json_path": str(json_path),
+        "query_id": query_id,
+        "response": response,
+        "correct_answer": correct_answer,
+        "is_completed": is_completed,
+        "status": status,
+        "skipped": True,
+        "skip_reason": reason,
+        "judge_prompt": None,
+        "judge_response": None,
+        "judge_result": {
+            "parse_error": True,
+            "skipped": True,
+            "correct": False,
+            "error": reason,
+        },
+        "tool_call_counts": tool_call_counts,
+        "citations": None,
+        "retrieval": {
+            "recall": retrieval_recall,
+            "retrieved_docids": sorted(list(retrieved_docids_set)),
+        },
+        "model_info": {
+            "judge_model": judge_model,
+            "max_output_tokens": max_output_tokens,
+        },
+    }
+
+
 # source: https://github.com/hendrycks/outlier-exposure/blob/master/utils/calibration_tools.py
 def calib_err(confidence, correct, p="2", beta=100):
     # beta is target bin size
@@ -580,7 +638,9 @@ def main():
     output_dir = mirror_directory_structure(input_dir, eval_dir)
     print(f"Evaluations will be saved to {output_dir}")
 
-    json_files = list(input_dir.glob("*.json"))
+    json_files = [
+        path for path in input_dir.glob("*.json") if not path.name.endswith("_eval.json")
+    ]
     if not json_files:
         print(f"No JSON files found in {input_dir}")
         return
@@ -588,15 +648,7 @@ def main():
     print(f"Found {len(json_files)} JSON files to evaluate")
 
     all_results = []
-
-    # Initialize vLLM engine and sampling params
-    llm = LLM(model=args.model, tensor_parallel_size=args.tensor_parallel_size)
-    sampling_params = SamplingParams(
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        max_tokens=args.max_output_tokens,
-    )
+    skipped = 0
 
     detected_model_name: Optional[str] = None
     first_run_path: Optional[Path] = json_files[0] if json_files else None
@@ -620,6 +672,14 @@ def main():
             try:
                 with eval_path.open("r", encoding="utf-8") as f:
                     existing_eval = json.load(f)
+                if is_skipped_evaluation(existing_eval):
+                    skipped += 1
+                    mark_skipped_as_failure(existing_eval)
+                    try:
+                        with eval_path.open("w", encoding="utf-8") as f:
+                            json.dump(existing_eval, f, indent=2, ensure_ascii=False)
+                    except Exception as e:
+                        print(f"Error normalizing skipped evaluation at {eval_path}: {e}")
                 all_results.append(existing_eval)
                 continue
             except Exception:
@@ -639,7 +699,8 @@ def main():
 
         correct_answer = ground_truth[str(query_id)]["answer"]
         gt_question = ground_truth[str(query_id)]["question"]
-        is_completed = run_data["status"] == "completed"
+        status = run_data.get("status")
+        is_completed = status == "completed"
         retrieved_docids_set = set(run_data.get("retrieved_docids", []))
         positives_for_query = qrel_evidence.get(str(query_id), [])
         retrieval_recall = len(
@@ -647,41 +708,32 @@ def main():
         ) / float(len(positives_for_query))
 
         response = ""
-        if (
-            len(run_data["result"]) > 0
-            and run_data["result"][-1]["type"] == "output_text"
-        ):
-            response = run_data["result"][-1]["output"]
+        result_items = run_data.get("result") or []
+        if result_items and result_items[-1].get("type") == "output_text":
+            response = result_items[-1].get("output") or ""
 
         if response == "" or not is_completed:
-            result = {
-                "json_path": str(json_path),
-                "query_id": query_id,
-                "response": response,
-                "correct_answer": correct_answer,
-                "is_completed": is_completed,
-                "judge_prompt": None,
-                "judge_response": None,
-                "judge_result": {
-                    "parse_error": True,
-                    "error": "Response incomplete or cannot be parsed",
-                },
-                "tool_call_counts": run_data.get("tool_call_counts", {}),
-                "citations": None,
-                "retrieval": {
-                    "recall": retrieval_recall,
-                    "retrieved_docids": sorted(list(retrieved_docids_set)),
-                },
-                "model_info": {
-                    "judge_model": args.model,
-                    "max_output_tokens": args.max_output_tokens,
-                },
-            }
+            reason = "Response missing or run status is not completed"
+            result = skipped_evaluation_result(
+                json_path=json_path,
+                query_id=query_id,
+                response=response,
+                correct_answer=correct_answer,
+                is_completed=is_completed,
+                status=status,
+                reason=reason,
+                tool_call_counts=run_data.get("tool_call_counts", {}),
+                retrieval_recall=retrieval_recall,
+                retrieved_docids_set=retrieved_docids_set,
+                judge_model=args.model,
+                max_output_tokens=args.max_output_tokens,
+            )
             try:
                 with eval_path.open("w", encoding="utf-8") as f:
                     json.dump(result, f, indent=2, ensure_ascii=False)
             except Exception as e:
                 print(f"Error saving evaluation to {eval_path}: {e}")
+            skipped += 1
             all_results.append(result)
             continue
 
@@ -701,69 +753,78 @@ def main():
             }
         )
 
-    for i in tqdm(
-        range(0, len(pending_items), args.batch_size), desc="Evaluating", unit="batch"
-    ):
-        batch = pending_items[i : i + args.batch_size]
-        messages_list = [
-            [{"role": "user", "content": item["judge_prompt"]}] for item in batch
-        ]
-        try:
-            outputs = llm.chat(
-                messages_list,
-                sampling_params,
-                chat_template_kwargs={"enable_thinking": False},
-            )
-        except Exception as e:
-            print(f"Error running vLLM batch {i}//{args.batch_size}: {e}")
-            continue
+    if pending_items:
+        llm = LLM(model=args.model, tensor_parallel_size=args.tensor_parallel_size)
+        sampling_params = SamplingParams(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            max_tokens=args.max_output_tokens,
+        )
 
-        for item, out in zip(batch, outputs or []):
-            judge_text = ""
+        for i in tqdm(
+            range(0, len(pending_items), args.batch_size), desc="Evaluating", unit="batch"
+        ):
+            batch = pending_items[i : i + args.batch_size]
+            messages_list = [
+                [{"role": "user", "content": item["judge_prompt"]}] for item in batch
+            ]
             try:
-                if getattr(out, "outputs", None):
-                    judge_text = out.outputs[0].text or ""
-            except Exception:
-                judge_text = ""
-
-            judge_result = parse_judge_response(judge_text)
-            cited_docids = extract_citations_from_response(item["response"])
-            citation_metrics_positives = compute_citation_metrics(
-                cited_docids, qrel_evidence.get(str(item["query_id"]), [])
-            )
-
-            result = {
-                "json_path": str(item["json_path"]),
-                "query_id": item["query_id"],
-                "question": item["gt_question"],
-                "response": item["response"],
-                "correct_answer": item["correct_answer"],
-                "is_completed": True,
-                "judge_prompt": item["judge_prompt"],
-                "judge_response": judge_text,
-                "judge_result": judge_result,
-                "tool_call_counts": item["tool_call_counts"],
-                "citations": {
-                    "cited_docids": cited_docids,
-                    "metrics": citation_metrics_positives,
-                },
-                "retrieval": {
-                    "retrieved_docids": sorted(list(item["retrieved_docids_set"])),
-                    "recall": item["retrieval_recall"],
-                },
-                "model_info": {
-                    "judge_model": args.model,
-                    "max_output_tokens": args.max_output_tokens,
-                },
-            }
-            try:
-                with item["eval_path"].open("w", encoding="utf-8") as f:
-                    json.dump(result, f, indent=2, ensure_ascii=False)
+                outputs = llm.chat(
+                    messages_list,
+                    sampling_params,
+                    chat_template_kwargs={"enable_thinking": False},
+                )
             except Exception as e:
-                print(f"Error saving evaluation to {item['eval_path']}: {e}")
-            all_results.append(result)
+                print(f"Error running vLLM batch {i}//{args.batch_size}: {e}")
+                continue
 
-    print(f"\nProcessed {len(all_results)} evaluations")
+            for item, out in zip(batch, outputs or []):
+                judge_text = ""
+                try:
+                    if getattr(out, "outputs", None):
+                        judge_text = out.outputs[0].text or ""
+                except Exception:
+                    judge_text = ""
+
+                judge_result = parse_judge_response(judge_text)
+                cited_docids = extract_citations_from_response(item["response"])
+                citation_metrics_positives = compute_citation_metrics(
+                    cited_docids, qrel_evidence.get(str(item["query_id"]), [])
+                )
+
+                result = {
+                    "json_path": str(item["json_path"]),
+                    "query_id": item["query_id"],
+                    "question": item["gt_question"],
+                    "response": item["response"],
+                    "correct_answer": item["correct_answer"],
+                    "is_completed": True,
+                    "judge_prompt": item["judge_prompt"],
+                    "judge_response": judge_text,
+                    "judge_result": judge_result,
+                    "tool_call_counts": item["tool_call_counts"],
+                    "citations": {
+                        "cited_docids": cited_docids,
+                        "metrics": citation_metrics_positives,
+                    },
+                    "retrieval": {
+                        "retrieved_docids": sorted(list(item["retrieved_docids_set"])),
+                        "recall": item["retrieval_recall"],
+                    },
+                    "model_info": {
+                        "judge_model": args.model,
+                        "max_output_tokens": args.max_output_tokens,
+                    },
+                }
+                try:
+                    with item["eval_path"].open("w", encoding="utf-8") as f:
+                        json.dump(result, f, indent=2, ensure_ascii=False)
+                except Exception as e:
+                    print(f"Error saving evaluation to {item['eval_path']}: {e}")
+                all_results.append(result)
+
+    print(f"\nProcessed {len(all_results)} evaluations ({skipped} judge skipped)")
 
     if not all_results:
         print("No results to analyze")

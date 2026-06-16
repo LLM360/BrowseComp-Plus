@@ -198,14 +198,10 @@ def _persist_failed_query(out_dir: str, *, model: str, query_id: str, args, erro
     error_payload = _exception_payload(error)
     normalized_results = [
         {
-            "type": "output_text",
+            "type": "error",
             "tool_name": None,
             "arguments": None,
-            "output": (
-                "Explanation: The query failed due to a harness or model API error.\n"
-                "Exact Answer: None\n"
-                "Confidence: 0%"
-            ),
+            "output": None,
             "error": error_payload,
         }
     ]
