@@ -154,6 +154,13 @@ def _safe_trace_name(value: str | None) -> str:
     return normalized or "single"
 
 
+def _safe_session_id(value: str | None) -> str:
+    if not value:
+        return f"single-{uuid.uuid4().hex}"
+    normalized = re.sub(r"[^A-Za-z0-9._:-]+", "_", str(value)).strip("._:-")
+    return normalized or f"single-{uuid.uuid4().hex}"
+
+
 def _safe_json_value(value: Any) -> Any:
     if value is None or isinstance(value, str | int | float | bool):
         return value
@@ -293,10 +300,12 @@ def run_conversation_with_tools(
     max_iterations: int = 100,
     raw_dump_dir: str | None = None,
     raw_trace_name: str | None = None,
+    session_id: str | None = None,
     tool_format: str | None = None,
     reasoning_effort: str | None = None,
 ):
     tools = tool_handler.get_tool_definitions()
+    session_id = _safe_session_id(session_id or raw_trace_name)
 
     messages: list[dict[str, Any]] = []
     if system_prompt:
@@ -336,6 +345,7 @@ def run_conversation_with_tools(
                 "messages": messages,
                 "tools": tools,
                 "max_tokens": request_max_tokens,
+                "extra_headers": {"X-Session-ID": session_id},
             }
             if chat_template_kwargs:
                 create_kwargs["extra_body"] = {
@@ -587,6 +597,7 @@ def _process_tsv_dataset(tsv_path: str, client: OpenAI, args, tool_handler: Sear
             max_iterations=args.max_iterations,
             raw_dump_dir=raw_dump_dir,
             raw_trace_name=raw_trace_name,
+            session_id=f"query_{qid}",
             tool_format=args.tool_format,
             reasoning_effort=args.reasoning_effort,
         )
@@ -810,6 +821,7 @@ def main():
         max_iterations=args.max_iterations,
         raw_dump_dir=str(Path(args.output_dir) / "raw_responses") if args.dump_raw_responses else None,
         raw_trace_name="single",
+        session_id="single",
         tool_format=args.tool_format,
         reasoning_effort=args.reasoning_effort,
     )
