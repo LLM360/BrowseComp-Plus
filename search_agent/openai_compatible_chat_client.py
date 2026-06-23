@@ -20,6 +20,15 @@ from glm_zai_client import SearchToolHandler, _persist_response
 from prompts import format_query
 
 
+REASONING_RESPONSE_FIELDS = (
+    "reasoning_content",
+    "reasoning",
+    "think",
+    "think_fast",
+    "think_faster",
+)
+
+
 def _split_reasoning_and_content(
     content: str | None,
 ) -> tuple[str | None, str | None]:
@@ -53,6 +62,44 @@ def _split_reasoning_and_content(
         answer_text = None
 
     return reasoning_text, answer_text
+
+
+def _normalize_reasoning_output(value: Any) -> Any | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if isinstance(value, list | tuple):
+        normalized = [
+            item
+            for item in (_normalize_reasoning_output(item) for item in value)
+            if item is not None
+        ]
+        return normalized or None
+    if isinstance(value, dict):
+        return value or None
+    return value if value else None
+
+
+def _extract_reasoning_output(
+    assistant_msg: dict[str, Any],
+    message_obj: Any = None,
+) -> tuple[Any | None, str | None]:
+    for field_name in REASONING_RESPONSE_FIELDS:
+        if field_name in assistant_msg:
+            reasoning_output = _normalize_reasoning_output(assistant_msg[field_name])
+            if reasoning_output is not None:
+                return reasoning_output, field_name
+
+        if message_obj is not None and hasattr(message_obj, field_name):
+            reasoning_output = _normalize_reasoning_output(
+                getattr(message_obj, field_name)
+            )
+            if reasoning_output is not None:
+                return reasoning_output, field_name
+
+    return None, None
 
 
 def _normalize_tool_name(name: str | None) -> str | None:
@@ -405,18 +452,32 @@ def run_conversation_with_tools(
             cumulative_usage["prompt_tokens_cached"] += cached_this
 
         assistant_msg = choice.message.model_dump()
+        message_extra = getattr(choice.message, "model_extra", None) or {}
+        if isinstance(message_extra, dict):
+            for key, value in message_extra.items():
+                assistant_msg.setdefault(key, value)
 
-        reasoning_output = assistant_msg.get("reasoning_content", None)
+        reasoning_output, reasoning_field = _extract_reasoning_output(
+            assistant_msg,
+            choice.message,
+        )
+        if reasoning_output is None:
+            assistant_msg["reasoning_content"] = ""
+            print(
+                "Debug: No recognized reasoning field in response "
+                f"({', '.join(REASONING_RESPONSE_FIELDS)}), attempting to extract from content..."
+            )
         content_reasoning, cleaned_content = _split_reasoning_and_content(
             assistant_msg.get("content")
         )
         textual_tool_calls, cleaned_content = _extract_textual_tool_calls(cleaned_content)
 
-        if isinstance(reasoning_output, str):
-            reasoning_output = reasoning_output.strip() or None
-
-        if not reasoning_output:
+        if not reasoning_output and content_reasoning:
             reasoning_output = content_reasoning
+            reasoning_field = "content"
+
+        if reasoning_output and reasoning_field != "reasoning_content":
+            assistant_msg["reasoning_content"] = reasoning_output
 
         if reasoning_output:
             normalized_results.append({
@@ -464,6 +525,7 @@ def run_conversation_with_tools(
                 "finish_reason": finish_reason,
                 "assistant_message": assistant_msg,
                 "reasoning_output": reasoning_output,
+                "reasoning_field": reasoning_field,
                 "content_reasoning": content_reasoning,
                 "cleaned_content": cleaned_content,
                 "textual_tool_calls": textual_tool_calls,
