@@ -66,20 +66,20 @@ def _split_reasoning_and_content(
 
 def _normalize_reasoning_output(value: Any) -> Any | None:
     if value is None:
-        return None
+        return ""
     if isinstance(value, str):
-        stripped = value.strip()
-        return stripped or None
+        # stripped = value.strip()
+        return value
     if isinstance(value, list | tuple):
         normalized = [
             item
             for item in (_normalize_reasoning_output(item) for item in value)
             if item is not None
         ]
-        return normalized or None
+        return normalized
     if isinstance(value, dict):
-        return value or None
-    return value if value else None
+        return value
+    return value
 
 
 def _extract_reasoning_output(
@@ -392,7 +392,7 @@ def run_conversation_with_tools(
                 "messages": messages,
                 "tools": tools,
                 "max_tokens": request_max_tokens,
-                "extra_headers": {"X-Session-ID": session_id},
+                "extra_headers": {"X-Session-ID": session_id, "x-smg-routing-key": session_id},
             }
             if chat_template_kwargs:
                 create_kwargs["extra_body"] = {
@@ -462,21 +462,21 @@ def run_conversation_with_tools(
             choice.message,
         )
         if reasoning_output is None:
-            assistant_msg["reasoning_content"] = ""
             print(
                 "Debug: No recognized reasoning field in response "
                 f"({', '.join(REASONING_RESPONSE_FIELDS)}), attempting to extract from content..."
             )
+            assistant_msg["reasoning_content"] = ""
         content_reasoning, cleaned_content = _split_reasoning_and_content(
             assistant_msg.get("content")
         )
         textual_tool_calls, cleaned_content = _extract_textual_tool_calls(cleaned_content)
 
-        if not reasoning_output and content_reasoning:
+        if not reasoning_output and content_reasoning: # reasoning parser from the endpoint fails, but we have reasoning in the content
             reasoning_output = content_reasoning
             reasoning_field = "content"
 
-        if reasoning_output and reasoning_field != "reasoning_content":
+        if reasoning_output and reasoning_field != "reasoning_content": # use reasoning_content field
             assistant_msg["reasoning_content"] = reasoning_output
 
         if reasoning_output:
