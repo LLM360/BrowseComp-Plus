@@ -487,7 +487,7 @@ def run_conversation_with_tools(
                 "output": [reasoning_output] if isinstance(reasoning_output, str) else reasoning_output,
             })
 
-        assistant_msg["content"] = cleaned_content
+        # assistant_msg["content"] = cleaned_content
         effective_tool_calls: list[dict[str, Any]] = []
 
         raw_tool_calls = getattr(choice.message, "tool_calls", None) or []
